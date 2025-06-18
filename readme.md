@@ -1,3 +1,4 @@
+![volta](volta.jpeg)
 # Volta: Secure Secret Storage and Data Encryption for Go Applications
 
 ## Introduction and Core Concepts
