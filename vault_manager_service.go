@@ -776,4 +776,6 @@ type VaultManagerService interface {
 	// audit.QueryResult: Comprehensive audit results for the tenant
 	// error: nil on success, error on failure or authorization denial
 	QueryTenantAuditLogs(tenantID string, options audit.QueryOptions) (audit.QueryResult, error)
+
+	DeleteTenant(tenatID string) error
 }

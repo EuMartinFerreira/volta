@@ -93,36 +93,6 @@ func (fl *FileLogger) Log(action string, success bool, metadata map[string]inter
 	return fl.writeEvent(event)
 }
 
-// LogSecretAccess implements the Logger interface
-func (fl *FileLogger) LogSecretAccess(action, secretID string, success bool, error string) error {
-	event := Event{
-		ID:        generateEventID(),
-		Timestamp: time.Now().UTC(),
-		TenantID:  fl.tenantID,
-		Action:    action,
-		Success:   success,
-		SecretID:  secretID,
-		Error:     error,
-	}
-
-	return fl.writeEvent(event)
-}
-
-// LogKeyOperation implements the Logger interface
-func (fl *FileLogger) LogKeyOperation(action, keyID string, success bool, error string) error {
-	event := Event{
-		ID:        generateEventID(),
-		Timestamp: time.Now().UTC(),
-		TenantID:  fl.tenantID,
-		Action:    action,
-		Success:   success,
-		KeyID:     keyID,
-		Error:     error,
-	}
-
-	return fl.writeEvent(event)
-}
-
 // writeEvent writes an event to the log file and updates cache
 func (fl *FileLogger) writeEvent(event Event) error {
 	fl.mu.Lock()

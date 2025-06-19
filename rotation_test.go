@@ -49,7 +49,7 @@ func TestRotateKeyBasic(t *testing.T) {
 	}
 
 	// Create vault - this should create initial key
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestRotateKeyEncryptionCompatibility(t *testing.T) {
 	vault, err := NewWithStore(Options{
 		DerivationPassphrase: testPassphrase,
 		EnvPassphraseVar:     "",
-	}, createStore(testStoreType, tempDir, tenantID), nil)
+	}, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestRotateKeyPersistence(t *testing.T) {
 		EnvPassphraseVar:     "",
 	}
 	// First vault instance
-	vault1, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault1, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create first vault: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestRotateKeyPersistence(t *testing.T) {
 	}
 
 	// Create second vault instance with same configuration
-	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create second vault: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestRotateKeyMultipleRotations(t *testing.T) {
 	vault, err := NewWithStore(Options{
 		DerivationPassphrase: testPassphrase,
 		EnvPassphraseVar:     "",
-	}, createStore(testStoreType, tempDir, tenantID), nil)
+	}, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestRotateKeyNoExistingKey(t *testing.T) {
 	vault, err := NewWithStore(Options{
 		DerivationPassphrase: testPassphrase,
 		EnvPassphraseVar:     "",
-	}, createStore(testStoreType, tempDir, tenantID), nil)
+	}, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestRotateKeyMetadataValidation(t *testing.T) {
 	vault, err := NewWithStore(Options{
 		DerivationPassphrase: testPassphrase,
 		EnvPassphraseVar:     "",
-	}, createStore(testStoreType, tempDir, tenantID), nil)
+	}, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}

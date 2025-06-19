@@ -26,8 +26,6 @@ const (
 // Logger interface for pluggable audit implementations
 type Logger interface {
 	Log(action string, success bool, metadata map[string]interface{}) error
-	LogSecretAccess(action, secretID string, success bool, error string) error
-	LogKeyOperation(action, keyID string, success bool, error string) error
 	Query(options QueryOptions) (QueryResult, error)
 	Close() error
 }
@@ -35,6 +33,7 @@ type Logger interface {
 // Event represents an audit log event
 type Event struct {
 	ID        string                 `json:"id"`
+	RequestID string                 `json:"request_id"`
 	Timestamp time.Time              `json:"timestamp"`
 	TenantID  string                 `json:"tenant_id"`
 	Action    string                 `json:"action"`

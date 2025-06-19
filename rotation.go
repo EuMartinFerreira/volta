@@ -152,6 +152,9 @@ import (
 // - Rollback Capability: Supports complete operation reversal on storage failures
 // - Integrity Checking: Validates storage integrity after successful updates
 func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
+	requestID := v.newRequestID()
+	startTime := time.Now()
+
 	// PRE-ROTATION SECURITY VALIDATION:
 	// Comprehensive validation ensuring vault readiness and security before
 	// attempting key rotation operations that could impact data accessibility.
@@ -194,8 +197,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// Ensures vault has active key available for re-encrypting existing data.
 	// Missing current key indicates vault initialization or consistency issues.
 	if v.currentKeyID == "" {
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":  "no current key available for rotation",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("no current key available for rotation"), map[string]interface{}{
 			"reason": reason,
 		})
 		return nil, fmt.Errorf("no current key available for rotation")
@@ -205,8 +207,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// Validates current key accessible in memory enclaves for cryptographic
 	// operations. Inaccessible keys prevent data re-encryption during rotation.
 	if _, exists := v.keyEnclaves[v.currentKeyID]; !exists {
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":          "current key not found in memory",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("current key not found in memory"), map[string]interface{}{
 			"current_key_id": v.currentKeyID,
 			"reason":         reason,
 		})
@@ -217,7 +218,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// Begins comprehensive audit trail for key rotation operation supporting
 	// security monitoring, compliance reporting, and forensic analysis.
 	// Audit trail provides complete visibility into rotation process.
-	v.audit.Log("ROTATE_START", true, map[string]interface{}{
+	v.logAudit(requestID, "ROTATE_START", nil, map[string]interface{}{
 		"current_key_id": v.currentKeyID,
 		"reason":         reason,
 	})
@@ -238,8 +239,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// Validates generated key ID meets length and format requirements
 	// preventing weak or invalid identifiers that could compromise security.
 	if newKeyID == "" || len(newKeyID) < 16 {
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":  "invalid key ID generated",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("invalid key ID generated"), map[string]interface{}{
 			"reason": reason,
 		})
 		return nil, fmt.Errorf("invalid key ID generated")
@@ -249,8 +249,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// Prevents duplicate key IDs that could create conflicts and security
 	// issues. Duplicate detection ensures unique key identification.
 	if _, exists := v.keyEnclaves[newKeyID]; exists {
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":      "duplicate key ID generated",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("duplicate key ID generated"), map[string]interface{}{
 			"new_key_id": newKeyID,
 			"reason":     reason,
 		})
@@ -266,8 +265,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// random number generation meeting cryptographic security standards.
 	newMasterKey := make([]byte, 32)
 	if _, err := rand.Read(newMasterKey); err != nil {
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":           "failed to generate new master key",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("failed to generate new master key: %s", err), map[string]interface{}{
 			"previous_key_id": previousKeyID,
 			"reason":          reason,
 		})
@@ -286,8 +284,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 		for i := range newMasterKey {
 			newMasterKey[i] = 0
 		}
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":  "generated key failed entropy check",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("generated key failed entropy check"), map[string]interface{}{
 			"reason": reason,
 		})
 		return nil, fmt.Errorf("generated key failed entropy check")
@@ -340,8 +337,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 			newKeyEnclave = nil // memguard handles cleanup internally
 		}
 
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":      fmt.Sprintf("failed to re-encrypt secrets: %v", err),
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("failed to re-encrypt secrets: %v", err), map[string]interface{}{
 			"old_key_id": oldKeyID,
 			"new_key_id": newKeyID,
 			"reason":     reason,
@@ -441,8 +437,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// using for key encryption operations ensuring security standards.
 	if len(derivationKeyBuffer.Bytes()) < 32 {
 		v.rollbackKeyRotation(oldKeyID, newKeyID)
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":  "derivation key is too short",
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("derivation key is too short"), map[string]interface{}{
 			"reason": reason,
 		})
 		return nil, fmt.Errorf("derivation key is too short")
@@ -461,8 +456,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 		if err != nil {
 			v.rollbackKeyRotation(oldKeyID, newKeyID)
 
-			v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-				"error":      fmt.Sprintf("failed to access key %s for persistence: %v", keyID, err),
+			v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("failed to access key %s for persistence: %v", keyID, err), map[string]interface{}{
 				"new_key_id": newKeyID,
 				"reason":     reason,
 			})
@@ -487,8 +481,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 		if err != nil {
 			v.rollbackKeyRotation(oldKeyID, newKeyID)
 
-			v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-				"error":      fmt.Sprintf("failed to encrypt key %s for persistence: %v", keyID, err),
+			v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("failed to encrypt key %s for persistence: %v", keyID, err), map[string]interface{}{
 				"new_key_id": newKeyID,
 				"reason":     reason,
 			})
@@ -520,8 +513,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	if err = v.saveKeyMetadata(rotationMetadata); err != nil {
 		v.rollbackKeyRotation(oldKeyID, newKeyID)
 
-		v.audit.Log("ROTATE_FAILED", false, map[string]interface{}{
-			"error":      fmt.Sprintf("failed to save key metadata: %v", err),
+		v.logAudit(requestID, "ROTATE_FAILED", fmt.Errorf("failed to save key metadata: %v", err), map[string]interface{}{
 			"new_key_id": newKeyID,
 			"reason":     reason,
 		})
@@ -532,7 +524,7 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// Validates rotation completed successfully with proper key transition
 	// and generates warnings for any inconsistencies detected.
 	if v.currentKeyID != newKeyID {
-		v.audit.Log("ROTATE_WARNING", false, map[string]interface{}{
+		v.logAudit(requestID, "ROTATE_WARNING", nil, map[string]interface{}{
 			"warning":  "current key ID mismatch after rotation",
 			"expected": newKeyID,
 			"actual":   v.currentKeyID,
@@ -548,7 +540,8 @@ func (v *Vault) RotateKey(reason string) (*KeyMetadata, error) {
 	// SUCCESSFUL ROTATION AUDIT:
 	// Generates comprehensive audit log entry documenting successful
 	// key rotation with complete context and impact information.
-	v.audit.Log("ROTATE_SUCCESS", true, map[string]interface{}{
+	v.logAudit(requestID, "ROTATE_SUCCESS", nil, map[string]interface{}{
+		"duration_ms":         time.Since(startTime).Milliseconds(),
 		"previous_key_id":     previousKeyID,
 		"new_key_id":          newKeyID,
 		"reencrypted_secrets": reencryptedCount,

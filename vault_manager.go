@@ -2,8 +2,11 @@ package volta
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"southwinds.dev/volta/audit"
 	"southwinds.dev/volta/persist"
+	"strings"
 	"sync"
 	"time"
 )
@@ -948,7 +951,7 @@ func (tm *VaultManager) GetVault(tenantID string) (VaultService, error) {
 	}
 
 	// Create vault with tenant store
-	vault, err := NewWithStore(tm.options, store, nil)
+	vault, err := NewWithStore(tm.options, store, tm.audit, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create vault for tenant %s: %w", tenantID, err)
 	}
@@ -1045,15 +1048,69 @@ func (tm *VaultManager) GetVault(tenantID string) (VaultService, error) {
 //
 // Thread Safety: Safe for concurrent use across multiple goroutines
 func (tm *VaultManager) CloseTenant(tenantID string) error {
+	startTime := time.Now()
+	requestID := tm.newRequestID()
+
+	tm.logAudit(requestID, "CLOSE_TENANT_INITIATED", tenantID, nil, map[string]interface{}{
+		"total_tenants_before": len(tm.vaults),
+	})
+
+	// Input validation
+	if tenantID == "" {
+		validationErr := fmt.Errorf("tenant ID cannot be empty")
+		tm.logAudit(requestID, "CLOSE_TENANT_VALIDATION_FAILED", tenantID, validationErr, map[string]interface{}{
+			"validation_error": "empty_tenant_id",
+		})
+		return validationErr
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if vault, exists := tm.vaults[tenantID]; exists {
-		if err := vault.Close(); err != nil {
-			return fmt.Errorf("failed to close vault for tenant %s: %w", tenantID, err)
-		}
-		delete(tm.vaults, tenantID)
+	vault, exists := tm.vaults[tenantID]
+	if !exists {
+		// Tenant not found - this is not an error, just log and return success
+		tm.logAudit(requestID, "CLOSE_TENANT_NOT_FOUND", tenantID, nil, map[string]interface{}{
+			"available_tenants": tm.getTenantList(),
+			"total_duration_ms": time.Since(startTime).Milliseconds(),
+			"operation_result":  "no_action_required",
+		})
+		return nil
 	}
+
+	tm.logAudit(requestID, "CLOSE_TENANT_FOUND", tenantID, nil, map[string]interface{}{
+		"vault_type": fmt.Sprintf("%T", vault),
+	})
+
+	// Attempt to close the vault
+	closeStartTime := time.Now()
+	if err := vault.Close(); err != nil {
+		closeErr := fmt.Errorf("failed to close vault for tenant %s: %w", tenantID, err)
+
+		tm.logAudit(requestID, "CLOSE_TENANT_VAULT_CLOSE_FAILED", tenantID, closeErr, map[string]interface{}{
+			"error_type":        tm.categorizeError(err),
+			"close_duration_ms": time.Since(closeStartTime).Milliseconds(),
+			"total_duration_ms": time.Since(startTime).Milliseconds(),
+			"vault_left_in_map": true,
+			"cleanup_status":    "failed",
+		})
+
+		return closeErr
+	}
+
+	tm.logAudit(requestID, "CLOSE_TENANT_VAULT_CLOSED", tenantID, nil, map[string]interface{}{
+		"close_duration_ms": time.Since(closeStartTime).Milliseconds(),
+	})
+
+	// Remove from map after successful close
+	delete(tm.vaults, tenantID)
+
+	tm.logAudit(requestID, "CLOSE_TENANT_COMPLETED", tenantID, nil, map[string]interface{}{
+		"total_tenants_after": len(tm.vaults),
+		"total_duration_ms":   time.Since(startTime).Milliseconds(),
+		"cleanup_status":      "success",
+		"operation_result":    "tenant_closed_and_removed",
+	})
 
 	return nil
 }
@@ -1120,17 +1177,113 @@ func (tm *VaultManager) CloseTenant(tenantID string) error {
 //	error: nil if all vaults closed successfully, aggregated error describing
 //	       any closure failures while still performing maximum cleanup
 func (tm *VaultManager) CloseAll() error {
+	startTime := time.Now()
+	requestID := tm.newRequestID()
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
+	initialTenantCount := len(tm.vaults)
+	tenantList := tm.getTenantList()
+
+	tm.logAudit(requestID, "CLOSE_ALL_VAULTS_INITIATED", "", nil, map[string]interface{}{
+		"total_vaults_to_close": initialTenantCount,
+		"tenant_list":           tenantList,
+	})
+
+	if initialTenantCount == 0 {
+		tm.logAudit(requestID, "CLOSE_ALL_VAULTS_NO_VAULTS_TO_CLOSE", "", nil, map[string]interface{}{
+			"total_duration_ms": time.Since(startTime).Milliseconds(),
+		})
+		return nil
+	}
+
 	var errs []error
+	var closeErrors []string
+	successCount := 0
+	var closeDetails = make(map[string]interface{})
+
+	tm.logAudit(requestID, "CLOSE_ALL_VAULTS_PROCESSING_START", "", nil, map[string]interface{}{
+		"vault_count": initialTenantCount,
+		"tenant_list": tenantList,
+	})
+
+	// Process each vault
+	index := 0
 	for tenantID, vault := range tm.vaults {
+		index++
+		tenantStartTime := time.Now()
+
+		tm.logAudit(requestID, "CLOSE_VAULT_TENANT_START", tenantID, nil, map[string]interface{}{
+			"tenant_index": index,
+			"total_count":  initialTenantCount,
+			"vault_type":   fmt.Sprintf("%T", vault),
+		})
+
 		if err := vault.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("tenant %s: %w", tenantID, err))
+			closeErr := fmt.Errorf("tenant %s: %w", tenantID, err)
+			errs = append(errs, closeErr)
+			closeErrors = append(closeErrors, fmt.Sprintf("tenant %s: %v", tenantID, err))
+
+			tm.logAudit(requestID, "CLOSE_VAULT_TENANT_FAILED", tenantID, err, map[string]interface{}{
+				"tenant_index": index,
+				"error_type":   tm.categorizeError(err),
+				"duration_ms":  time.Since(tenantStartTime).Milliseconds(),
+			})
+
+			// Store individual failure details
+			closeDetails[fmt.Sprintf("tenant_%s_error", tenantID)] = err.Error()
+			closeDetails[fmt.Sprintf("tenant_%s_duration_ms", tenantID)] = time.Since(tenantStartTime).Milliseconds()
+		} else {
+			successCount++
+
+			tm.logAudit(requestID, "CLOSE_VAULT_TENANT_SUCCESS", tenantID, nil, map[string]interface{}{
+				"tenant_index": index,
+				"duration_ms":  time.Since(tenantStartTime).Milliseconds(),
+			})
+
+			// Store individual success details
+			closeDetails[fmt.Sprintf("tenant_%s_duration_ms", tenantID)] = time.Since(tenantStartTime).Milliseconds()
 		}
 	}
 
+	// Clear the vaults map
 	tm.vaults = make(map[string]VaultService)
+
+	tm.logAudit(requestID, "CLOSE_ALL_VAULTS_MEMORY_CLEARED", "", nil, map[string]interface{}{
+		"vaults_remaining": len(tm.vaults),
+	})
+
+	totalDuration := time.Since(startTime)
+	failureCount := initialTenantCount - successCount
+
+	// Final audit logging based on outcome
+	finalMetadata := map[string]interface{}{
+		"total_vaults":      initialTenantCount,
+		"successful_closes": successCount,
+		"failed_closes":     failureCount,
+		"success_rate":      float64(successCount) / float64(initialTenantCount) * 100,
+		"total_duration_ms": totalDuration.Milliseconds(),
+		"tenant_list":       tenantList,
+		"close_details":     closeDetails,
+	}
+
+	if failureCount == 0 {
+		// Complete success
+		tm.logAudit(requestID, "CLOSE_ALL_VAULTS_COMPLETED_SUCCESS", "", nil, finalMetadata)
+	} else if successCount == 0 {
+		// Complete failure
+		combinedError := fmt.Errorf("errors closing vaults: %v", errs)
+		finalMetadata["close_errors"] = closeErrors
+		finalMetadata["error_details"] = errs
+		tm.logAudit(requestID, "CLOSE_ALL_VAULTS_COMPLETED_TOTAL_FAILURE", "", combinedError, finalMetadata)
+	} else {
+		// Partial success
+		partialError := fmt.Errorf("errors closing vaults: %v", errs)
+		finalMetadata["close_errors"] = closeErrors
+		finalMetadata["error_details"] = errs
+		tm.logAudit(requestID, "CLOSE_ALL_VAULTS_COMPLETED_PARTIAL_SUCCESS", "", partialError, finalMetadata)
+	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors closing vaults: %v", errs)
@@ -1233,51 +1386,190 @@ func (tm *VaultManager) CloseAll() error {
 //	[]BulkOperationResult: Detailed results for each tenant operation
 //	error: nil on successful completion, error on system-level failures
 func (tm *VaultManager) RotateAllTenantKeys(tenantIDs []string, reason string) ([]BulkOperationResult, error) {
-	if len(tenantIDs) == 0 {
-		// Get all tenants if none specified
-		allTenants, err := tm.ListTenants()
-		if err != nil {
-			return nil, fmt.Errorf("failed to list tenants: %w", err)
-		}
-		tenantIDs = allTenants
+	startTime := time.Now()
+	requestID := tm.newRequestID()
+
+	// Initialize audit metadata
+	initialMetadata := map[string]interface{}{
+		"requested_tenant_count": len(tenantIDs),
+		"reason":                 reason,
+		"has_specific_tenants":   tenantIDs != nil && len(tenantIDs) > 0,
 	}
 
-	results := make([]BulkOperationResult, 0, len(tenantIDs))
+	tm.logAudit(requestID, "ROTATE_ALL_KEYS_INITIATED", "", nil, initialMetadata)
 
-	for _, tenantID := range tenantIDs {
+	// Default reason if not provided
+	if reason == "" {
+		reason = "bulk key rotation"
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_REASON_DEFAULTED", "", nil, map[string]interface{}{
+			"default_reason": reason,
+		})
+	}
+
+	// If no specific tenants provided, get all tenants
+	if len(tenantIDs) == 0 {
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_LISTING_ALL_TENANTS", "", nil, nil)
+
+		allTenants, err := tm.ListTenants()
+		if err != nil {
+			listErr := fmt.Errorf("failed to list tenants: %w", err)
+			tm.logAudit(requestID, "ROTATE_ALL_KEYS_LIST_TENANTS_FAILED", "", listErr, map[string]interface{}{
+				"error_type": tm.categorizeError(err),
+			})
+			return nil, listErr
+		}
+
+		tenantIDs = allTenants
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_ALL_TENANTS_RETRIEVED", "", nil, map[string]interface{}{
+			"total_tenants_found": len(allTenants),
+			"tenant_list":         allTenants,
+		})
+	} else {
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_USING_PROVIDED_TENANTS", "", nil, map[string]interface{}{
+			"provided_tenants": tenantIDs,
+		})
+	}
+
+	if len(tenantIDs) == 0 {
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_NO_TENANTS_TO_PROCESS", "", nil, map[string]interface{}{
+			"total_duration_ms": time.Since(startTime).Milliseconds(),
+		})
+		return []BulkOperationResult{}, nil
+	}
+
+	// Log bulk operation start with final tenant list
+	tm.logAudit(requestID, "ROTATE_ALL_KEYS_PROCESSING_START", "", nil, map[string]interface{}{
+		"final_tenant_count": len(tenantIDs),
+		"tenant_list":        tenantIDs,
+		"reason":             reason,
+	})
+
+	results := make([]BulkOperationResult, 0, len(tenantIDs))
+	successCount := 0
+	var processingErrors []string
+
+	for i, tenantID := range tenantIDs {
+		tenantStartTime := time.Now()
+
+		tm.logAudit(requestID, "ROTATE_KEY_TENANT_START", tenantID, nil, map[string]interface{}{
+			"tenant_index": i + 1,
+			"total_count":  len(tenantIDs),
+			"reason":       reason,
+		})
+
 		result := BulkOperationResult{
 			TenantID:  tenantID,
 			Timestamp: time.Now().UTC(),
-			Details:   make(map[string]interface{}),
+			Details: map[string]interface{}{
+				"reason":     reason,
+				"operation":  "key_rotation",
+				"request_id": requestID,
+			},
 		}
 
-		result.Details["reason"] = reason
-
+		// Get the vault for this tenant
 		vault, err := tm.GetVault(tenantID)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("failed to access vault: %v", err)
 			results = append(results, result)
+
+			tm.logAudit(requestID, "ROTATE_KEY_GET_VAULT_FAILED", tenantID, err, map[string]interface{}{
+				"tenant_index": i + 1,
+				"error_type":   tm.categorizeError(err),
+				"duration_ms":  time.Since(tenantStartTime).Milliseconds(),
+			})
+
+			processingErrors = append(processingErrors, fmt.Sprintf("tenant %s: get vault failed", tenantID))
 			continue
 		}
 
+		tm.logAudit(requestID, "ROTATE_KEY_VAULT_RETRIEVED", tenantID, nil, map[string]interface{}{
+			"tenant_index": i + 1,
+			"vault_type":   fmt.Sprintf("%T", vault),
+		})
+
 		// Get old key info before rotation
+		oldKeyRetrievalStart := time.Now()
 		oldKeyMeta, err := vault.GetActiveKeyMetadata()
 		if err == nil {
 			result.Details["old_key_id"] = oldKeyMeta.KeyID
+			tm.logAudit(requestID, "ROTATE_KEY_OLD_KEY_RETRIEVED", tenantID, nil, map[string]interface{}{
+				"tenant_index":          i + 1,
+				"old_key_id":            oldKeyMeta.KeyID,
+				"retrieval_duration_ms": time.Since(oldKeyRetrievalStart).Milliseconds(),
+			})
+		} else {
+			tm.logAudit(requestID, "ROTATE_KEY_OLD_KEY_RETRIEVAL_FAILED", tenantID, err, map[string]interface{}{
+				"tenant_index":          i + 1,
+				"error_type":            tm.categorizeError(err),
+				"retrieval_duration_ms": time.Since(oldKeyRetrievalStart).Milliseconds(),
+			})
+			result.Details["old_key_retrieval_error"] = err.Error()
 		}
 
 		// Perform the rotation using existing RotateKey method
+		rotationStartTime := time.Now()
 		newKeyMeta, err := vault.RotateKey(reason)
+		rotationDuration := time.Since(rotationStartTime)
+
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("key rotation failed: %v", err)
+
+			tm.logAudit(requestID, "ROTATE_KEY_ROTATION_FAILED", tenantID, err, map[string]interface{}{
+				"tenant_index":         i + 1,
+				"error_type":           tm.categorizeError(err),
+				"rotation_duration_ms": rotationDuration.Milliseconds(),
+				"total_duration_ms":    time.Since(tenantStartTime).Milliseconds(),
+				"old_key_id":           result.Details["old_key_id"], // May be nil
+			})
+
+			processingErrors = append(processingErrors, fmt.Sprintf("tenant %s: rotation failed", tenantID))
 		} else {
 			result.Success = true
 			result.Details["new_key_id"] = newKeyMeta.KeyID
+			successCount++
+
+			tm.logAudit(requestID, "ROTATE_KEY_TENANT_SUCCESS", tenantID, nil, map[string]interface{}{
+				"tenant_index":         i + 1,
+				"old_key_id":           result.Details["old_key_id"], // May be nil
+				"new_key_id":           newKeyMeta.KeyID,
+				"rotation_duration_ms": rotationDuration.Milliseconds(),
+				"total_duration_ms":    time.Since(tenantStartTime).Milliseconds(),
+			})
 		}
 
 		results = append(results, result)
+	}
+
+	totalDuration := time.Since(startTime)
+	failureCount := len(tenantIDs) - successCount
+
+	// Final audit logging based on outcome
+	finalMetadata := map[string]interface{}{
+		"total_tenants":        len(tenantIDs),
+		"successful_rotations": successCount,
+		"failed_rotations":     failureCount,
+		"success_rate":         float64(successCount) / float64(len(tenantIDs)) * 100,
+		"reason":               reason,
+		"total_duration_ms":    totalDuration.Milliseconds(),
+		"tenant_list":          tenantIDs,
+	}
+
+	if failureCount == 0 {
+		// Complete success
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_COMPLETED_SUCCESS", "", nil, finalMetadata)
+	} else if successCount == 0 {
+		// Complete failure
+		combinedError := fmt.Errorf("all key rotations failed")
+		finalMetadata["processing_errors"] = processingErrors
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_COMPLETED_TOTAL_FAILURE", "", combinedError, finalMetadata)
+	} else {
+		// Partial success
+		partialError := fmt.Errorf("partial failure: %d succeeded, %d failed", successCount, failureCount)
+		finalMetadata["processing_errors"] = processingErrors
+		tm.logAudit(requestID, "ROTATE_ALL_KEYS_COMPLETED_PARTIAL_SUCCESS", "", partialError, finalMetadata)
 	}
 
 	return results, nil
@@ -2942,47 +3234,93 @@ func (tm *VaultManager) GetAuditSummary(tenantID string, since *time.Time) (Audi
 //	[]BulkOperationResult: Detailed results for each tenant operation with success/failure status
 //	error: Critical errors preventing operation initiation; individual tenant failures reported in results
 func (tm *VaultManager) RotateAllTenantPassphrases(tenantIDs []string, newPassphrase string, reason string) ([]BulkOperationResult, error) {
+	startTime := time.Now()
+	requestID := tm.newRequestID()
+
+	// Initialize audit metadata
+	initialMetadata := map[string]interface{}{
+		"requested_tenant_count": len(tenantIDs),
+		"reason":                 reason,
+		"has_specific_tenants":   tenantIDs != nil && len(tenantIDs) > 0,
+	}
+
+	tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_INITIATED", "", nil, initialMetadata)
+
 	// Input validation
 	if newPassphrase == "" {
-		return nil, fmt.Errorf("new passphrase cannot be empty")
+		validationErr := fmt.Errorf("new passphrase cannot be empty")
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_VALIDATION_FAILED", "", validationErr, map[string]interface{}{
+			"validation_error": "empty_passphrase",
+		})
+		return nil, validationErr
 	}
 
 	if reason == "" {
 		reason = "bulk passphrase rotation"
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_REASON_DEFAULTED", "", nil, map[string]interface{}{
+			"default_reason": reason,
+		})
 	}
 
 	// If no specific tenants provided, get all tenants
 	if tenantIDs == nil || len(tenantIDs) == 0 {
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_LISTING_ALL_TENANTS", "", nil, nil)
+
 		allTenants, err := tm.ListTenants()
 		if err != nil {
-			return nil, fmt.Errorf("failed to list tenants: %w", err)
+			listErr := fmt.Errorf("failed to list tenants: %w", err)
+			tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_LIST_TENANTS_FAILED", "", listErr, map[string]interface{}{
+				"error_type": tm.categorizeError(err),
+			})
+			return nil, listErr
 		}
+
 		tenantIDs = allTenants
-	}
-
-	if len(tenantIDs) == 0 {
-		return []BulkOperationResult{}, nil
-	}
-
-	results := make([]BulkOperationResult, len(tenantIDs))
-
-	// Log bulk operation start
-	if tm.audit != nil {
-		tm.audit.Log("bulk_passphrase_rotation_start", true, map[string]interface{}{
-			"tenant_count": len(tenantIDs),
-			"reason":       reason,
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_ALL_TENANTS_RETRIEVED", "", nil, map[string]interface{}{
+			"total_tenants_found": len(allTenants),
+			"tenant_list":         allTenants,
+		})
+	} else {
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_USING_PROVIDED_TENANTS", "", nil, map[string]interface{}{
+			"provided_tenants": tenantIDs,
 		})
 	}
 
-	// Process each tenant
+	if len(tenantIDs) == 0 {
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_NO_TENANTS_TO_PROCESS", "", nil, map[string]interface{}{
+			"total_duration_ms": time.Since(startTime).Milliseconds(),
+		})
+		return []BulkOperationResult{}, nil
+	}
+
+	// Log bulk operation start with final tenant list
+	tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_PROCESSING_START", "", nil, map[string]interface{}{
+		"final_tenant_count": len(tenantIDs),
+		"tenant_list":        tenantIDs,
+		"reason":             reason,
+	})
+
+	results := make([]BulkOperationResult, len(tenantIDs))
 	successCount := 0
+	var processingErrors []string
+
+	// Process each tenant
 	for i, tenantID := range tenantIDs {
+		tenantStartTime := time.Now()
+
+		tm.logAudit(requestID, "ROTATE_PASSPHRASE_TENANT_START", tenantID, nil, map[string]interface{}{
+			"tenant_index": i + 1,
+			"total_count":  len(tenantIDs),
+			"reason":       reason,
+		})
+
 		result := BulkOperationResult{
 			TenantID:  tenantID,
 			Timestamp: time.Now().UTC(),
 			Details: map[string]interface{}{
-				"reason":    reason,
-				"operation": "passphrase_rotation",
+				"reason":     reason,
+				"operation":  "passphrase_rotation",
+				"request_id": requestID,
 			},
 		}
 
@@ -2991,13 +3329,36 @@ func (tm *VaultManager) RotateAllTenantPassphrases(tenantIDs []string, newPassph
 		if err != nil {
 			result.Error = fmt.Sprintf("failed to get vault: %v", err)
 			results[i] = result
+
+			tm.logAudit(requestID, "ROTATE_PASSPHRASE_GET_VAULT_FAILED", tenantID, err, map[string]interface{}{
+				"tenant_index": i + 1,
+				"error_type":   tm.categorizeError(err),
+				"duration_ms":  time.Since(tenantStartTime).Milliseconds(),
+			})
+
+			processingErrors = append(processingErrors, fmt.Sprintf("tenant %s: get vault failed", tenantID))
 			continue
 		}
 
+		tm.logAudit(requestID, "ROTATE_PASSPHRASE_VAULT_RETRIEVED", tenantID, nil, map[string]interface{}{
+			"tenant_index": i + 1,
+			"vault_type":   fmt.Sprintf("%T", vault),
+		})
+
 		// Perform the rotation on the vault
+		rotationStartTime := time.Now()
 		if err := vault.RotatePassphrase(newPassphrase, reason); err != nil {
 			result.Error = fmt.Sprintf("passphrase rotation failed: %v", err)
 			results[i] = result
+
+			tm.logAudit(requestID, "ROTATE_PASSPHRASE_ROTATION_FAILED", tenantID, err, map[string]interface{}{
+				"tenant_index":         i + 1,
+				"error_type":           tm.categorizeError(err),
+				"rotation_duration_ms": time.Since(rotationStartTime).Milliseconds(),
+				"total_duration_ms":    time.Since(tenantStartTime).Milliseconds(),
+			})
+
+			processingErrors = append(processingErrors, fmt.Sprintf("tenant %s: rotation failed", tenantID))
 			continue
 		}
 
@@ -3005,19 +3366,231 @@ func (tm *VaultManager) RotateAllTenantPassphrases(tenantIDs []string, newPassph
 		result.Success = true
 		results[i] = result
 		successCount++
-	}
 
-	// Log bulk operation completion
-	if tm.audit != nil {
-		tm.audit.Log("bulk_passphrase_rotation_complete", true, map[string]interface{}{
-			"total_tenants":        len(tenantIDs),
-			"successful_rotations": successCount,
-			"failed_rotations":     len(tenantIDs) - successCount,
-			"reason":               reason,
+		tm.logAudit(requestID, "ROTATE_PASSPHRASE_TENANT_SUCCESS", tenantID, nil, map[string]interface{}{
+			"tenant_index":         i + 1,
+			"rotation_duration_ms": time.Since(rotationStartTime).Milliseconds(),
+			"total_duration_ms":    time.Since(tenantStartTime).Milliseconds(),
 		})
 	}
 
+	totalDuration := time.Since(startTime)
+	failureCount := len(tenantIDs) - successCount
+
+	// Final audit logging based on outcome
+	finalMetadata := map[string]interface{}{
+		"total_tenants":        len(tenantIDs),
+		"successful_rotations": successCount,
+		"failed_rotations":     failureCount,
+		"success_rate":         float64(successCount) / float64(len(tenantIDs)) * 100,
+		"reason":               reason,
+		"total_duration_ms":    totalDuration.Milliseconds(),
+		"tenant_list":          tenantIDs,
+	}
+
+	if failureCount == 0 {
+		// Complete success
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_COMPLETED_SUCCESS", "", nil, finalMetadata)
+	} else if successCount == 0 {
+		// Complete failure
+		combinedError := fmt.Errorf("all passphrase rotations failed")
+		finalMetadata["processing_errors"] = processingErrors
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_COMPLETED_TOTAL_FAILURE", "", combinedError, finalMetadata)
+	} else {
+		// Partial success
+		partialError := fmt.Errorf("partial failure: %d succeeded, %d failed", successCount, failureCount)
+		finalMetadata["processing_errors"] = processingErrors
+		tm.logAudit(requestID, "ROTATE_ALL_PASSPHRASES_COMPLETED_PARTIAL_SUCCESS", "", partialError, finalMetadata)
+	}
+
 	return results, nil
+}
+
+// DeleteTenant permanently removes a tenant and its associated vault from the VaultManager.
+//
+// This method implements a "fail-safe" deletion strategy where the tenant is immediately
+// removed from the active vaults map to prevent zombie states, even if subsequent cleanup
+// operations fail. All operations are comprehensively audited for compliance and monitoring.
+//
+// Parameters:
+//   - tenantID: Unique identifier for the tenant to be deleted. Must be a non-empty string.
+//
+// Returns:
+//   - error: nil on successful deletion and cleanup
+//   - error: tenant not found error if tenantID doesn't exist in the vault map
+//   - error: cleanup error if tenant was removed but resource cleanup failed
+//
+// Thread Safety:
+//
+//	This method is thread-safe and uses a mutex lock to ensure atomic operations
+//	during tenant lookup and removal from the vaults map.
+//
+// Audit Events:
+//   - DELETE_TENANT_INITIATED: When deletion process begins
+//   - DELETE_TENANT_NOT_FOUND: When tenant doesn't exist
+//   - DELETE_TENANT_REMOVED_FROM_MAP: When tenant is removed from active vaults
+//   - DELETE_TENANT_VAULT_CLEANUP_FAILED: When vault deletion fails
+//   - DELETE_TENANT_CLOSE_FAILED: When vault close operation fails
+//   - DELETE_TENANT_COMPLETED: When deletion completes successfully
+//   - DELETE_TENANT_PARTIAL_FAILURE: When deletion completes with cleanup errors
+func (tm *VaultManager) DeleteTenant(tenantID string) error {
+	startTime := time.Now()
+	requestID := tm.newRequestID()
+
+	tm.logAudit(requestID, "DELETE_TENANT_INITIATED", tenantID, nil, map[string]interface{}{
+		"total_tenants_before": len(tm.vaults),
+	})
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	// Get the vault for this tenant
+	vault, exists := tm.vaults[tenantID]
+	if !exists {
+		notFoundErr := fmt.Errorf("tenant %s not found", tenantID)
+		tm.logAudit(requestID, "DELETE_TENANT_NOT_FOUND", tenantID, notFoundErr, map[string]interface{}{
+			"available_tenants": tm.getTenantList(),
+		})
+		return notFoundErr
+	}
+
+	// Audit log - tenant found, proceeding with removal
+	tm.logAudit(requestID, "DELETE_TENANT_FOUND", tenantID, nil, map[string]interface{}{
+		"vault_type": fmt.Sprintf("%T", vault),
+	})
+
+	// Remove from map immediately to prevent new operations
+	delete(tm.vaults, tenantID)
+
+	// Audit log - tenant removed from active map
+	tm.logAudit(requestID, "DELETE_TENANT_REMOVED_FROM_MEMORY", tenantID, nil, map[string]interface{}{
+		"total_tenants_after": len(tm.vaults),
+		"removal_strategy":    "fail_safe",
+	})
+
+	// Attempt cleanup - if this fails, we don't re-add to map
+	var cleanupErrors []string
+	var cleanupDetails = make(map[string]interface{})
+
+	// Vault-specific cleanup
+	vaultCleanupStart := time.Now()
+	if err := vault.DeleteTenant(tenantID); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Sprintf("vault deletion failed: %v", err))
+
+		tm.logAudit(requestID, "DELETE_TENANT_VAULT_CLEANUP_FAILED", tenantID, err, map[string]interface{}{
+			"cleanup_phase": "vault_deletion",
+			"error_type":    tm.categorizeError(err),
+			"duration_ms":   time.Since(vaultCleanupStart).Milliseconds(),
+		})
+
+		cleanupDetails["vault_cleanup_error"] = err.Error()
+		cleanupDetails["vault_cleanup_duration_ms"] = time.Since(vaultCleanupStart).Milliseconds()
+	} else {
+		tm.logAudit(requestID, "DELETE_TENANT_VAULT_CLEANUP_SUCCESS", tenantID, nil, map[string]interface{}{
+			"cleanup_phase": "vault_deletion",
+			"duration_ms":   time.Since(vaultCleanupStart).Milliseconds(),
+		})
+		cleanupDetails["vault_cleanup_duration_ms"] = time.Since(vaultCleanupStart).Milliseconds()
+	}
+
+	// Additional cleanup (connections, resources, etc.)
+	if closer, ok := vault.(io.Closer); ok {
+		closeStart := time.Now()
+		if err := closer.Close(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("vault close failed: %v", err))
+
+			tm.logAudit(requestID, "DELETE_TENANT_CLOSE_FAILED", tenantID, err, map[string]interface{}{
+				"cleanup_phase": "connection_close",
+				"error_type":    tm.categorizeError(err),
+				"duration_ms":   time.Since(closeStart).Milliseconds(),
+			})
+
+			cleanupDetails["close_error"] = err.Error()
+			cleanupDetails["close_duration_ms"] = time.Since(closeStart).Milliseconds()
+		} else {
+			tm.logAudit(requestID, "DELETE_TENANT_CLOSE_SUCCESS", tenantID, nil, map[string]interface{}{
+				"cleanup_phase": "connection_close",
+				"duration_ms":   time.Since(closeStart).Milliseconds(),
+			})
+			cleanupDetails["close_duration_ms"] = time.Since(closeStart).Milliseconds()
+		}
+	}
+
+	totalDuration := time.Since(startTime)
+
+	// Final audit logs based on outcome
+	if len(cleanupErrors) > 0 {
+		combinedError := fmt.Errorf(strings.Join(cleanupErrors, "; "))
+		tm.logAudit(requestID, "DELETE_TENANT_PARTIAL_FAILURE", tenantID, combinedError, map[string]interface{}{
+			"cleanup_errors_count": len(cleanupErrors),
+			"cleanup_errors":       cleanupErrors,
+			"tenant_state":         "deleted_with_cleanup_errors",
+			"cleanup_details":      cleanupDetails,
+			"total_duration_ms":    totalDuration.Milliseconds(),
+		})
+
+		return fmt.Errorf("tenant %s removed but cleanup had errors: %s", tenantID, strings.Join(cleanupErrors, "; "))
+	}
+
+	// Complete success
+	tm.logAudit(requestID, "DELETE_TENANT_COMPLETED", tenantID, nil, map[string]interface{}{
+		"tenant_state":      "completely_deleted",
+		"cleanup_details":   cleanupDetails,
+		"total_duration_ms": totalDuration.Milliseconds(),
+	})
+
+	return nil
+}
+
+// Utility functions
+func (tm *VaultManager) logAudit(requestID, action, tenantID string, err error, metadata map[string]interface{}) {
+	if tm.audit == nil {
+		log.Printf("WAARNING: skipping audit logging, logger not initialized\n")
+		return
+	}
+	if metadata == nil {
+		metadata = make(map[string]interface{})
+	}
+
+	// Add standard fields
+	metadata["tenant_id"] = tenantID
+	metadata["user_id"] = tm.options.UserID
+	metadata["request_id"] = requestID
+	metadata["timestamp"] = time.Now().UTC()
+
+	success := err == nil
+	if err != nil {
+		metadata["error"] = err.Error()
+	}
+
+	if auditErr := tm.audit.Log(action, success, metadata); auditErr != nil {
+		log.Printf("ERROR: audit logging failed for action %s: %v\n", action, auditErr)
+	}
+}
+
+func (tm *VaultManager) getTenantList() []string {
+	tenants := make([]string, 0, len(tm.vaults))
+	for tenantID := range tm.vaults {
+		tenants = append(tenants, tenantID)
+	}
+	return tenants
+}
+
+func (tm *VaultManager) categorizeError(err error) string {
+	// Categorize errors for better monitoring
+	errStr := err.Error()
+	switch {
+	case strings.Contains(errStr, "connection"):
+		return "connection_error"
+	case strings.Contains(errStr, "timeout"):
+		return "timeout_error"
+	case strings.Contains(errStr, "permission"):
+		return "permission_error"
+	case strings.Contains(errStr, "not found"):
+		return "not_found_error"
+	default:
+		return "unknown_error"
+	}
 }
 
 /* helper methods */
@@ -3098,6 +3671,10 @@ func (tm *VaultManager) filterAuditEvents(events []audit.Event, options audit.Qu
 	}
 
 	return filtered
+}
+
+func (tm *VaultManager) newRequestID() string {
+	return fmt.Sprintf("vm_%d", time.Now().UnixNano())
 }
 
 // Helper function to determine if an action is passphrase-related

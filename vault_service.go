@@ -1570,4 +1570,8 @@ type VaultService interface {
 	//       "user_agent": "MyApplication/1.0",
 	//   })
 	GetAudit() audit.Logger
+
+	// DeleteTenant securely removes all resources (secrets, keys, metadata) associated with a tenant.
+	// This operation is irreversible, ensuring that no data can be recovered after deletion.
+	DeleteTenant(tenantID string) error
 }

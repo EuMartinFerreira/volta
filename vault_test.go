@@ -217,7 +217,7 @@ func createTestVaultForRestore(t *testing.T, passphrase string) *Vault {
 	store := createStore(testStoreType, restoreDir, tenantID) // Use the restore directory
 
 	// Create vault but DON'T initialize it
-	vault, err := NewWithStore(options, store, nil)
+	vault, err := NewWithStore(options, store, nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault for restore: %v", err)
 	}

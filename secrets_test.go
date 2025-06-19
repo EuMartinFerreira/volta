@@ -179,7 +179,7 @@ func TestSecretExists(t *testing.T) {
 func TestUpdateSecret(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestUpdateSecret(t *testing.T) {
 func TestGetSecretMetadata(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestGetSecretMetadata(t *testing.T) {
 func TestDeleteSecret(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestDeleteSecret(t *testing.T) {
 func TestDeleteNonExistentSecret(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -513,7 +513,7 @@ func TestDeleteNonExistentSecret(t *testing.T) {
 func TestListSecrets(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -699,7 +699,7 @@ func TestListSecretsNoFilters(t *testing.T) {
 func TestSecretErrors(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -745,7 +745,7 @@ func TestSecretErrors(t *testing.T) {
 func TestLargeSecretData(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -896,7 +896,7 @@ func TestLargeSecretData(t *testing.T) {
 func TestSpecialCharactersInSecretID(t *testing.T) {
 	options := createTestVaultOptions(t)
 
-	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -2932,5 +2932,5 @@ func TestSecretChecksumValidation(t *testing.T) {
 }
 
 func newTestVault(options Options) (VaultService, error) {
-	return NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	return NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 }

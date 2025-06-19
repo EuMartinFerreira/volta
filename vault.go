@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"github.com/awnumar/memguard"
 	"golang.org/x/crypto/chacha20poly1305"
+	"log"
 	"os"
 	"regexp"
 	"southwinds.dev/volta/audit"
 	"southwinds.dev/volta/internal/debug"
 	"southwinds.dev/volta/mem"
 	"southwinds.dev/volta/persist"
+	"strings"
 	"sync"
 	"time"
 )
@@ -49,6 +51,12 @@ type Vault struct {
 
 	// Audit logging
 	audit audit.Logger
+
+	// the owner of the vault
+	userID string
+
+	// the owning tenant of the vault
+	tenantID string
 
 	closed bool
 }
@@ -104,12 +112,21 @@ type Vault struct {
 //	    return fmt.Errorf("failed to create vault: %w", err)
 //	}
 //	defer vault.Close()
-func NewWithStore(options Options, store persist.Store, auditLogger audit.Logger) (VaultService, error) {
+func NewWithStore(options Options, store persist.Store, auditLogger audit.Logger, tenantID string) (VaultService, error) {
 	// Validate options before processing
 	// This ensures all required configuration is present and valid before
 	// attempting any cryptographic operations or storage access
 	if err := validateOptions(options); err != nil {
 		return nil, fmt.Errorf("invalid options: %w", err)
+	}
+
+	var userID = options.UserID
+	if userID == "" {
+		userID = "system"
+	}
+
+	if len(tenantID) == 0 {
+		return nil, fmt.Errorf("missing tenant ID")
 	}
 
 	// Set up audit logger - use no-op logger if none provided
@@ -158,6 +175,12 @@ func NewWithStore(options Options, store persist.Store, auditLogger audit.Logger
 
 		// Audit logging
 		audit: auditLogger,
+
+		// the owner of the vault
+		userID: userID,
+
+		// the tenant who owns the vault
+		tenantID: tenantID,
 	}
 
 	// Attempt to enable memory protection
@@ -217,18 +240,15 @@ func NewWithStore(options Options, store persist.Store, auditLogger audit.Logger
 
 	// Log successful vault initialization for audit purposes
 	// This creates an audit trail of vault access and configuration
-	if v.audit != nil {
-		if auditErr := v.audit.Log("vault_initialized", true, map[string]interface{}{
-			"store_type":           store.GetType(),        // Type of storage backend
-			"memory_protection":    protectionLevel,        // Level of memory protection achieved
-			"has_existing_keys":    len(v.keyMetadata) > 0, // Whether existing keys were loaded
-			"has_existing_secrets": v.getSecretsCount(),    // Number of secrets in the vault
-			"current_key_id":       v.currentKeyID,         // Active key identifier
-		}); auditErr != nil {
-			// Audit logging failure is not fatal but should be noted
-			fmt.Printf("WARNING: %v\n", auditErr)
-		}
-	}
+	requestID := v.newRequestID()
+
+	v.logAudit(requestID, "VAULT_INITIALIZED", nil, map[string]interface{}{
+		"store_type":           store.GetType(),        // Type of storage backend
+		"memory_protection":    protectionLevel,        // Level of memory protection achieved
+		"has_existing_keys":    len(v.keyMetadata) > 0, // Whether existing keys were loaded
+		"has_existing_secrets": v.getSecretsCount(),    // Number of secrets in the vault
+		"current_key_id":       v.currentKeyID,         // Active key identifier
+	})
 
 	return v, nil
 }
@@ -336,27 +356,77 @@ func NewWithStore(options Options, store persist.Store, auditLogger audit.Logger
 //   - SecretExists: For checking secret existence before storage
 //   - DeleteSecret: For removing secrets from the vault
 func (v *Vault) StoreSecret(secretID string, secretData []byte, tags []string, contentType ContentType) (*SecretMetadata, error) {
+	startTime := time.Now()
+	requestID := v.newRequestID()
+
+	v.logAudit(requestID, "STORE_SECRET_INITIATED", nil, map[string]interface{}{
+		"secret_id":    secretID,
+		"content_type": string(contentType),
+		"data_size":    len(secretData),
+		"tag_count":    len(tags),
+	})
+
 	if v.closed {
-		return nil, fmt.Errorf("vault is closed")
+		err := fmt.Errorf("vault is closed")
+		v.logAudit(requestID, "STORE_SECRET_FAILED", err, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "vault_closed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, err
 	}
 
 	if err := validateSecretID(secretID); err != nil {
-		return nil, fmt.Errorf("invalid secret ID: %w", err)
+		validationErr := fmt.Errorf("invalid secret ID: %w", err)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", validationErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "invalid_secret_id",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, validationErr
 	}
 
 	if len(secretData) == 0 {
-		return nil, fmt.Errorf("secret data cannot be empty")
+		emptyDataErr := fmt.Errorf("secret data cannot be empty")
+		v.logAudit(requestID, "STORE_SECRET_FAILED", emptyDataErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "empty_secret_data",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, emptyDataErr
 	} else if err := validateSecretData(secretData, contentType); err != nil {
-		return nil, fmt.Errorf("invalid secret data: %w", err)
+		dataValidationErr := fmt.Errorf("invalid secret data: %w", err)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", dataValidationErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "invalid_secret_data",
+			"content_type":   string(contentType),
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, dataValidationErr
 	}
 
 	if validTags, err := validateAndSanitizeTags(tags); err != nil {
-		return nil, fmt.Errorf("invalid secret tags: %w; valid tags are: %v", err, validTags)
+		tagValidationErr := fmt.Errorf("invalid secret tags: %w; valid tags are: %v", err, validTags)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", tagValidationErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "invalid_tags",
+			"invalid_tags":   tags,
+			"valid_tags":     validTags,
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, tagValidationErr
 	}
 	tags = deduplicateTags(tags)
 
 	if !isValidContentType(contentType) {
-		return nil, fmt.Errorf("invalid content type: %s", contentType)
+		contentTypeErr := fmt.Errorf("invalid content type: %s", contentType)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", contentTypeErr, map[string]interface{}{
+			"secret_id":            secretID,
+			"failure_reason":       "invalid_content_type",
+			"invalid_content_type": string(contentType),
+			"duration_ms":          time.Since(startTime).Milliseconds(),
+		})
+		return nil, contentTypeErr
 	}
 
 	v.mu.Lock()
@@ -365,18 +435,37 @@ func (v *Vault) StoreSecret(secretID string, secretData []byte, tags []string, c
 	// Get current secrets container
 	container, err := v.getSecretsContainer()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get secrets container: %w", err)
+		containerErr := fmt.Errorf("failed to get secrets container: %w", err)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", containerErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "container_retrieval_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, containerErr
 	}
 
 	// Check if secret already exists
 	if _, exists := container.Secrets[secretID]; exists {
-		return nil, fmt.Errorf("secret %s already exists, use UpdateSecret to modify", secretID)
+		duplicateErr := fmt.Errorf("secret %s already exists, use UpdateSecret to modify", secretID)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", duplicateErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "secret_already_exists",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, duplicateErr
 	}
 
 	// Encrypt the secret data
 	encryptedData, err := v.encryptWithCurrentKey(secretData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt secret: %w", err)
+		encryptionErr := fmt.Errorf("failed to encrypt secret: %w", err)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", encryptionErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "encryption_failed",
+			"key_id":         v.currentKeyID,
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, encryptionErr
 	}
 
 	// Calculate metadata
@@ -406,7 +495,7 @@ func (v *Vault) StoreSecret(secretID string, secretData []byte, tags []string, c
 	secretEntry := &SecretEntry{
 		ID:        secretID,
 		Data:      encryptedData,
-		Metadata:  secretMetadata, // Use the complete metadata
+		Metadata:  secretMetadata,
 		CreatedAt: now,
 		UpdatedAt: now,
 		Tags:      tags,
@@ -418,22 +507,44 @@ func (v *Vault) StoreSecret(secretID string, secretData []byte, tags []string, c
 
 	// Update container in memory
 	if err = v.updateSecretsContainer(container); err != nil {
-		return nil, fmt.Errorf("failed to update secrets container: %w", err)
+		memoryErr := fmt.Errorf("failed to update secrets container: %w", err)
+		v.logAudit(requestID, "STORE_SECRET_FAILED", memoryErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "memory_update_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, memoryErr
 	}
 
 	// Persist to storage
 	if err = v.persistSecretsToStore(); err != nil {
-		return nil, fmt.Errorf("failed to persist secrets: %w", err)
+		persistErr := fmt.Errorf("failed to persist secrets: %w", err)
+		v.logAudit(requestID, "STORE_SECRET_CRITICAL_FAILURE", persistErr, map[string]interface{}{
+			"secret_id":       secretID,
+			"persist_error":   err.Error(),
+			"data_integrity":  "memory_updated_storage_failed",
+			"requires_manual": "verification",
+			"duration_ms":     time.Since(startTime).Milliseconds(),
+		})
+		return nil, persistErr
 	}
 
-	// Log audit event
-	if v.audit != nil {
-		if err = v.audit.LogSecretAccess("STORE", secretID, true, ""); err != nil {
-			fmt.Printf("WARNING: %v\n", err)
-		}
-	}
+	// Success - log completion with key metadata
+	v.logAudit(requestID, "STORE_SECRET_COMPLETED", nil, map[string]interface{}{
+		"secret_id":           secretID,
+		"duration_ms":         time.Since(startTime).Milliseconds(),
+		"total_secrets_count": len(container.Secrets),
+		"stored_secret_metadata": map[string]interface{}{
+			"content_type":      string(contentType),
+			"size_bytes":        secretSize,
+			"tag_count":         len(tags),
+			"encryption_key_id": v.currentKeyID,
+			"checksum":          checksum[:16], // First 16 chars for audit
+			"version":           1,
+		},
+	})
 
-	return secretMetadata, nil // Now returns complete metadata!
+	return secretMetadata, nil
 }
 
 // GetSecret retrieves and decrypts a secret from the vault by its ID.
@@ -478,12 +589,31 @@ func (v *Vault) StoreSecret(secretID string, secretData []byte, tags []string, c
 //	//     return processSecret(data)
 //	// })
 func (v *Vault) GetSecret(secretID string) (*SecretResult, error) {
+	startTime := time.Now()
+	requestID := v.newRequestID()
+
+	v.logAudit(requestID, "GET_SECRET_INITIATED", nil, map[string]interface{}{
+		"secret_id": secretID,
+	})
+
 	if v.closed {
-		return nil, fmt.Errorf("vault is closed")
+		err := fmt.Errorf("vault is closed")
+		v.logAudit(requestID, "GET_SECRET_FAILED", err, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "vault_closed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, err
 	}
 
 	if err := validateSecretID(secretID); err != nil {
-		return nil, fmt.Errorf("invalid secret ID: %w", err)
+		validationErr := fmt.Errorf("invalid secret ID: %w", err)
+		v.logAudit(requestID, "GET_SECRET_FAILED", validationErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "invalid_secret_id",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, validationErr
 	}
 
 	v.mu.Lock()
@@ -492,42 +622,55 @@ func (v *Vault) GetSecret(secretID string) (*SecretResult, error) {
 	// Get current secrets container
 	container, err := v.getSecretsContainer()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get secrets container: %w", err)
+		containerErr := fmt.Errorf("failed to get secrets container: %w", err)
+		v.logAudit(requestID, "GET_SECRET_FAILED", containerErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "container_retrieval_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, containerErr
 	}
 
 	// Find secret entry
 	secretEntry, exists := container.Secrets[secretID]
 	if !exists {
-		if v.audit != nil {
-			if auditErr := v.audit.LogSecretAccess("GET", secretID, false, "secret not found"); auditErr != nil {
-				fmt.Printf("WARNING: %v\n", auditErr)
-			}
-		}
-		return nil, fmt.Errorf("secret %s not found", secretID)
+		notFoundErr := fmt.Errorf("secret %s not found", secretID)
+		v.logAudit(requestID, "GET_SECRET_FAILED", notFoundErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "secret_not_found",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, notFoundErr
 	}
 
 	// Decrypt the secret - this now needs to return both data and whether active key was used
 	secretData, usedActiveKey, err := v.decryptWithCurrentKey(secretEntry.Data)
 	if err != nil {
-		if v.audit != nil {
-			if auditErr := v.audit.LogSecretAccess("GET", secretID, false, err.Error()); auditErr != nil {
-				fmt.Printf("WARNING: %v\n", auditErr)
-			}
-		}
-		return nil, fmt.Errorf("failed to decrypt secret: %w", err)
+		decryptErr := fmt.Errorf("failed to decrypt secret: %w", err)
+		v.logAudit(requestID, "GET_SECRET_FAILED", decryptErr, map[string]interface{}{
+			"secret_id":       secretID,
+			"failure_reason":  "decryption_failed",
+			"used_active_key": usedActiveKey,
+			"duration_ms":     time.Since(startTime).Milliseconds(),
+		})
+		return nil, decryptErr
 	}
 
+	// Update access tracking
 	secretEntry.Metadata.AccessCount++
 	now := time.Now().UTC()
 	secretEntry.Metadata.LastAccessed = &now
 	container.Secrets[secretID] = secretEntry
 
+	// Track access tracking update status
+	accessTrackingSuccess := true
 	if updateErr := v.updateSecretsContainer(container); updateErr != nil {
-		// Don't fail the read operation, but log the issue
+		accessTrackingSuccess = false
 		fmt.Printf("WARNING: failed to update access tracking in memory: %v\n", updateErr)
 	} else {
 		// Only persist if memory update succeeded
 		if persistErr := v.persistSecretsToStore(); persistErr != nil {
+			accessTrackingSuccess = false
 			fmt.Printf("WARNING: failed to persist access tracking: %v\n", persistErr)
 		}
 	}
@@ -551,11 +694,20 @@ func (v *Vault) GetSecret(secretID string) (*SecretResult, error) {
 	}
 
 	// Log successful access
-	if v.audit != nil {
-		if auditErr := v.audit.LogSecretAccess("GET", secretID, true, ""); auditErr != nil {
-			fmt.Printf("WARNING: %v\n", auditErr)
-		}
-	}
+	v.logAudit(requestID, "GET_SECRET_COMPLETED", nil, map[string]interface{}{
+		"secret_id":               secretID,
+		"duration_ms":             time.Since(startTime).Milliseconds(),
+		"used_active_key":         usedActiveKey,
+		"access_tracking_success": accessTrackingSuccess,
+		"access_count":            secretEntry.Metadata.AccessCount,
+		"secret_metadata": map[string]interface{}{
+			"content_type": secretEntry.Metadata.ContentType,
+			"size":         secretEntry.Metadata.Size,
+			"version":      secretEntry.Version,
+			"has_expiry":   secretEntry.Metadata.ExpiresAt != nil,
+			"tag_count":    len(secretEntry.Tags),
+		},
+	})
 
 	return &SecretResult{
 		Data:          secretData,
@@ -616,16 +768,44 @@ func (v *Vault) GetSecret(secretID string) (*SecretResult, error) {
 //	}
 //	fmt.Printf("Secret updated to version %d\n", metadata.Version)
 func (v *Vault) UpdateSecret(secretID string, secretData []byte, tags []string, contentType ContentType) (*SecretMetadata, error) {
+	startTime := time.Now()
+	requestID := v.newRequestID()
+
+	v.logAudit(requestID, "UPDATE_SECRET_INITIATED", nil, map[string]interface{}{
+		"secret_id":    secretID,
+		"data_size":    len(secretData),
+		"content_type": string(contentType),
+		"tags_count":   len(tags),
+	})
+
 	if v.closed {
-		return nil, fmt.Errorf("vault is closed")
+		err := fmt.Errorf("vault is closed")
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", err, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "vault_closed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, err
 	}
 
 	if err := validateSecretID(secretID); err != nil {
-		return nil, fmt.Errorf("invalid secret ID: %w", err)
+		validationErr := fmt.Errorf("invalid secret ID: %w", err)
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", validationErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "invalid_secret_id",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, validationErr
 	}
 
 	if len(secretData) == 0 {
-		return nil, fmt.Errorf("secret data cannot be empty")
+		dataErr := fmt.Errorf("secret data cannot be empty")
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", dataErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "empty_secret_data",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, dataErr
 	}
 
 	tags = deduplicateTags(tags)
@@ -636,19 +816,42 @@ func (v *Vault) UpdateSecret(secretID string, secretData []byte, tags []string, 
 	// Get current secrets container
 	container, err := v.getSecretsContainer()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get secrets container: %w", err)
+		containerErr := fmt.Errorf("failed to get secrets container: %w", err)
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", containerErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "container_retrieval_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, containerErr
 	}
 
 	// Find existing secret entry
 	secretEntry, exists := container.Secrets[secretID]
 	if !exists {
-		return nil, fmt.Errorf("secret %s not found", secretID)
+		notFoundErr := fmt.Errorf("secret %s not found", secretID)
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", notFoundErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "secret_not_found",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, notFoundErr
 	}
+
+	// Store previous version for audit
+	previousVersion := secretEntry.Version
+	previousSize := secretEntry.Metadata.Size
+	previousContentType := secretEntry.Metadata.ContentType
 
 	// Encrypt the new secret data
 	encryptedData, err := v.encryptWithCurrentKey(secretData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt secret: %w", err)
+		encryptErr := fmt.Errorf("failed to encrypt secret: %w", err)
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", encryptErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "encryption_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, encryptErr
 	}
 
 	// Calculate new metadata
@@ -656,38 +859,41 @@ func (v *Vault) UpdateSecret(secretID string, secretData []byte, tags []string, 
 	checksum := fmt.Sprintf("%x", sha256.Sum256(secretData))
 	now := time.Now().UTC()
 
-	// **FIX: Update both the SecretEntry fields AND the embedded Metadata**
 	// Update SecretEntry level fields
 	secretEntry.Data = encryptedData
 	secretEntry.UpdatedAt = now
 	secretEntry.Version++
-	secretEntry.Tags = tags // **CRITICAL: Update tags at SecretEntry level**
+	secretEntry.Tags = tags
 
 	// Update embedded Metadata fields
 	secretEntry.Metadata.ContentType = contentType
 	secretEntry.Metadata.Size = secretSize
 	secretEntry.Metadata.Checksum = checksum
-	// Note: Don't update SecretID, CreatedAt, AccessCount, LastAccessed in updates
 
 	// Update container in memory
 	container.Secrets[secretID] = secretEntry
 	if err = v.updateSecretsContainer(container); err != nil {
-		return nil, fmt.Errorf("failed to update secrets container: %w", err)
+		updateErr := fmt.Errorf("failed to update secrets container: %w", err)
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", updateErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "memory_update_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, updateErr
 	}
 
 	// Persist to storage
 	if err = v.persistSecretsToStore(); err != nil {
-		return nil, fmt.Errorf("failed to persist secrets: %w", err)
+		persistErr := fmt.Errorf("failed to persist secrets: %w", err)
+		v.logAudit(requestID, "UPDATE_SECRET_FAILED", persistErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "persist_failed",
+			"duration_ms":    time.Since(startTime).Milliseconds(),
+		})
+		return nil, persistErr
 	}
 
-	// Log audit event
-	if v.audit != nil {
-		if err = v.audit.LogSecretAccess("UPDATE", secretID, true, ""); err != nil {
-			fmt.Printf("WARNING: %v\n", err)
-		}
-	}
-
-	// **FIX: Return complete metadata combining SecretEntry and Metadata fields**
+	// Return complete metadata combining SecretEntry and Metadata fields
 	returnMetadata := &SecretMetadata{
 		SecretID:     secretEntry.ID,
 		ContentType:  secretEntry.Metadata.ContentType,
@@ -700,10 +906,30 @@ func (v *Vault) UpdateSecret(secretID string, secretData []byte, tags []string, 
 		LastAccessed: secretEntry.Metadata.LastAccessed,
 		ExpiresAt:    secretEntry.Metadata.ExpiresAt,
 		CustomFields: secretEntry.Metadata.CustomFields,
-		Tags:         secretEntry.Tags, // **CRITICAL: Use Tags from SecretEntry**
+		Tags:         secretEntry.Tags,
 		Checksum:     secretEntry.Metadata.Checksum,
 		KeyID:        secretEntry.Metadata.KeyID,
 	}
+
+	// Success - log completion with key metadata
+	v.logAudit(requestID, "UPDATE_SECRET_COMPLETED", nil, map[string]interface{}{
+		"secret_id":   secretID,
+		"duration_ms": time.Since(startTime).Milliseconds(),
+		"version_change": map[string]interface{}{
+			"from": previousVersion,
+			"to":   secretEntry.Version,
+		},
+		"size_change": map[string]interface{}{
+			"from": previousSize,
+			"to":   secretSize,
+		},
+		"content_type_change": map[string]interface{}{
+			"from": string(previousContentType),
+			"to":   string(contentType),
+		},
+		"tags_updated":   len(tags) > 0,
+		"final_checksum": checksum,
+	})
 
 	return returnMetadata, nil
 }
@@ -764,13 +990,29 @@ func (v *Vault) UpdateSecret(secretID string, secretData []byte, tags []string, 
 //	}
 //	log.Printf("Secret successfully deleted")
 func (v *Vault) DeleteSecret(secretID string) error {
+	startTime := time.Now()
+	requestID := v.newRequestID()
+
+	v.logAudit(requestID, "DELETE_SECRET_INITIATED", nil, map[string]interface{}{
+		"secret_id": secretID,
+	})
 
 	if v.closed {
-		return fmt.Errorf("vault is closed")
+		err := fmt.Errorf("vault is closed")
+		v.logAudit(requestID, "DELETE_SECRET_FAILED", err, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "vault_closed",
+		})
+		return err
 	}
 
 	if err := validateSecretID(secretID); err != nil {
-		return fmt.Errorf("invalid secret ID: %w", err)
+		validationErr := fmt.Errorf("invalid secret ID: %w", err)
+		v.logAudit(requestID, "DELETE_SECRET_FAILED", validationErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "invalid_secret_id",
+		})
+		return validationErr
 	}
 
 	v.mu.Lock()
@@ -779,13 +1021,23 @@ func (v *Vault) DeleteSecret(secretID string) error {
 	// Get current secrets container
 	container, err := v.getSecretsContainer()
 	if err != nil {
-		return fmt.Errorf("failed to get secrets container: %w", err)
+		containerErr := fmt.Errorf("failed to get secrets container: %w", err)
+		v.logAudit(requestID, "DELETE_SECRET_FAILED", containerErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "container_retrieval_failed",
+		})
+		return containerErr
 	}
 
 	// Check if secret exists
 	secretEntry, exists := container.Secrets[secretID]
 	if !exists {
-		return fmt.Errorf("secret %s does not exist", secretID)
+		notFoundErr := fmt.Errorf("secret %s does not exist", secretID)
+		v.logAudit(requestID, "DELETE_SECRET_FAILED", notFoundErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "secret_not_found",
+		})
+		return notFoundErr
 	}
 
 	// Store backup for rollback (deep copy)
@@ -815,12 +1067,12 @@ func (v *Vault) DeleteSecret(secretID string) error {
 
 	// Update the secrets container in memory
 	if err = v.updateSecretsContainer(container); err != nil {
-		if v.audit != nil {
-			if auditErr := v.audit.LogSecretAccess("DELETE", secretID, false, err.Error()); auditErr != nil {
-				fmt.Printf("WARNING: %v\n", auditErr)
-			}
-		}
-		return fmt.Errorf("failed to update secrets container: %w", err)
+		updateErr := fmt.Errorf("failed to update secrets container: %w", err)
+		v.logAudit(requestID, "DELETE_SECRET_FAILED", updateErr, map[string]interface{}{
+			"secret_id":      secretID,
+			"failure_reason": "memory_update_failed",
+		})
+		return updateErr
 	}
 
 	// Persist changes to store
@@ -828,43 +1080,37 @@ func (v *Vault) DeleteSecret(secretID string) error {
 		// Rollback: restore the backup container
 		if rollbackErr := v.updateSecretsContainer(backup); rollbackErr != nil {
 			// Critical error: both operation and rollback failed
-			if v.audit != nil {
-				if auditErr := v.audit.Log("critical_error", false, map[string]interface{}{
-					"operation":    "DELETE",
-					"secret_id":    secretID,
-					"error":        err.Error(),
-					"rollback_err": rollbackErr.Error(),
-				}); auditErr != nil {
-					fmt.Printf("WARNING: %v\n", auditErr)
-				}
-			}
-			return fmt.Errorf("failed to persist secrets and rollback failed: persist_err=%w, rollback_err=%v", err, rollbackErr)
+			criticalErr := fmt.Errorf("failed to persist secrets and rollback failed: persist_err=%w, rollback_err=%v", err, rollbackErr)
+			v.logAudit(requestID, "DELETE_SECRET_CRITICAL_FAILURE", criticalErr, map[string]interface{}{
+				"secret_id":      secretID,
+				"persist_error":  err.Error(),
+				"rollback_error": rollbackErr.Error(),
+				"data_integrity": "compromised",
+			})
+			return criticalErr
 		}
 
-		if v.audit != nil {
-			if auditErr := v.audit.LogSecretAccess("DELETE", secretID, false, err.Error()); auditErr != nil {
-				fmt.Printf("WARNING: %v\n", auditErr)
-			}
-		}
-		return fmt.Errorf("failed to persist secrets: %w", err)
+		// Rollback successful
+		persistErr := fmt.Errorf("failed to persist secrets: %w", err)
+		v.logAudit(requestID, "DELETE_SECRET_FAILED", persistErr, map[string]interface{}{
+			"secret_id":       secretID,
+			"failure_reason":  "persist_failed_rollback_successful",
+			"rollback_status": "successful",
+		})
+		return persistErr
 	}
 
-	// Log successful deletion
-	if v.audit != nil {
-		if auditErr := v.audit.LogSecretAccess("DELETE", secretID, true, ""); auditErr != nil {
-			fmt.Printf("WARNING: %v\n", auditErr)
-		}
-
-		// Also log general operation
-		if auditErr := v.audit.Log("secret_deleted", true, map[string]interface{}{
-			"secret_id":    secretID,
+	// Success - log completion with key metadata
+	v.logAudit(requestID, "DELETE_SECRET_COMPLETED", nil, map[string]interface{}{
+		"secret_id":               secretID,
+		"duration_ms":             time.Since(startTime).Milliseconds(),
+		"remaining_secrets_count": len(container.Secrets),
+		"deleted_secret_metadata": map[string]interface{}{
 			"had_tags":     len(secretEntry.Tags) > 0,
 			"content_type": secretEntry.Metadata.ContentType,
 			"version":      secretEntry.Version,
-		}); auditErr != nil {
-			fmt.Printf("WARNING: %v\n", auditErr)
-		}
-	}
+		},
+	})
 
 	return nil
 }
@@ -1397,29 +1643,29 @@ func (v *Vault) SecureMemoryProtection() string {
 //	    return nil
 //	}
 func (v *Vault) Close() error {
+	requestID := v.newRequestID()
+
 	var errs []error
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	// **FIX: Ensure all data is persisted before closing**
+	// Ensure all data is persisted before closing
 	if v.secretsContainer != nil {
 		if err := v.persistSecretsToStore(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to persist secrets before close: %w", err))
 		}
 	}
 
-	// **FIX: Add a closed flag to prevent further operations**
+	// Add a closed flag to prevent further operations
 	v.closed = true
 
 	// Close audit logger (but do it after persistence)
 	if v.audit != nil {
 		// Log vault shutdown before closing
-		if err := v.audit.Log("vault_shutdown", len(errs) == 0, map[string]interface{}{
+		v.logAudit(requestID, "VAULT_SHUTDOWN", combinerErr(errs), map[string]interface{}{
 			"errors": len(errs),
-		}); err != nil {
-			fmt.Printf("WARNING: %v\n", err)
-		}
+		})
 
 		if err := v.audit.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close audit logger: %w", err))
@@ -1452,6 +1698,62 @@ func (v *Vault) Close() error {
 	if len(errs) > 0 {
 		return fmt.Errorf("vault close errors: %v", errs)
 	}
+
+	return nil
+}
+
+func combinerErr(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	for _, err := range errs {
+		sb.WriteString(err.Error())
+		sb.WriteString("; ")
+	}
+	return fmt.Errorf(strings.TrimRight(sb.String(), " "))
+}
+
+// DeleteTenant securely removes all resources associated with a specified tenant.
+//
+// This operation is irreversible, ensuring that all data related to the tenant,
+// including secrets, keys, and metadata, are securely deleted from storage.
+//
+// Parameters:
+//   - tenantID: A unique identifier for the tenant whose resources are to be deleted.
+//     This ID is used to locate and remove all associated data.
+//
+// Returns:
+//   - error: Returns nil if the deletion is successful, or an error if the deletion
+//     fails. The error provides detailed information about what went wrong,
+//     which can be useful for auditing and troubleshooting.
+//
+// Security Notes:
+//   - This operation ensures that all data associated with the tenant ID is securely wiped,
+//     eliminating risks of data recovery.
+//   - Actions taken are logged for audit purposes, capturing both successful deletions
+//     and any errors encountered during the process.
+//
+// Example Usage:
+//
+//	err := vault.DeleteTenant("tenant-1234")
+//	if err != nil {
+//	    log.Printf("Failed to delete tenant: %v", err)
+//	} else {
+//	    log.Println("Tenant deleted successfully.")
+//	}
+func (v *Vault) DeleteTenant(tenantID string) error {
+	requestID := v.newRequestID()
+
+	// Step 1: Securely delete the tenant's resources from storage
+	if err := v.store.DeleteTenant(tenantID); err != nil {
+		err = fmt.Errorf("failed to delete tenant %s and its resources: %w", tenantID, err)
+		v.logAudit(requestID, "DELETE_TENANT", err, nil)
+		return err
+	}
+
+	// Step 2: Log the deletion for audit purposes
+	v.logAudit(requestID, "DELETE_TENANT", nil, nil)
 
 	return nil
 }
@@ -1792,6 +2094,8 @@ func (v *Vault) decryptWithKeyEnclave(encryptedData []byte, enclave *memguard.En
 }
 
 func (v *Vault) createNewSecretsContainer() error {
+	requestID := v.newRequestID()
+
 	debug.Print("createNewSecretsContainer: Starting\n")
 
 	now := time.Now()
@@ -1829,19 +2133,15 @@ func (v *Vault) createNewSecretsContainer() error {
 
 	debug.Print("createNewSecretsContainer: About to persist to store\n")
 	// Save the container to disk
-	if err := v.persistSecretsToStore(); err != nil {
+	if err = v.persistSecretsToStore(); err != nil {
 		return fmt.Errorf("failed to persist secrets container: %w", err)
 	}
 	debug.Print("createNewSecretsContainer: Successfully persisted to store\n")
 
 	// Log container creation
-	if v.audit != nil {
-		if auditErr := v.audit.Log("secrets_container_created", true, map[string]interface{}{
-			"version": container.Version,
-		}); auditErr != nil {
-			fmt.Printf("WARNING: %v\n", auditErr)
-		}
-	}
+	v.logAudit(requestID, "SECRETS_CONTAINER_CREATED", nil, map[string]interface{}{
+		"version": container.Version,
+	})
 
 	debug.Print("createNewSecretsContainer: Completed successfully\n")
 	return nil
@@ -1858,6 +2158,8 @@ func (v *Vault) getSecretsCount() int {
 
 // loadSecretsFromStore loads secrets from persistent storage into memory
 func (v *Vault) loadSecretsFromStore() error {
+	requestID := v.newRequestID()
+
 	// Check if secrets data exists
 	exists, err := v.store.SecretsDataExists()
 	if err != nil {
@@ -1896,15 +2198,12 @@ func (v *Vault) loadSecretsFromStore() error {
 
 	// Log successful loading
 	if v.audit != nil {
-		if auditErr := v.audit.Log("secrets_loaded", true, map[string]interface{}{
+		v.logAudit(requestID, "SECRETS_LOADED", nil, map[string]interface{}{
 			"secrets_count": len(container.Secrets),
 			"version":       container.Version,
 			"timestamp":     container.Timestamp,
-		}); auditErr != nil {
-			fmt.Printf("WARNING: %v\n", auditErr)
-		}
+		})
 	}
-
 	return nil
 }
 
@@ -2013,4 +2312,33 @@ func (v *Vault) encryptWithKeyEnclave(data []byte, enclave *memguard.Enclave) ([
 	debug.Print("encryptWithKeyEnclave: Final encrypted size: %d, first 32: %x\n", len(result), result[:min(32, len(result))])
 
 	return result, nil
+}
+
+func (v *Vault) logAudit(requestID, action string, err error, metadata map[string]interface{}) {
+	if v.audit == nil {
+		log.Printf("WAARNING: skipping audit logging, logger not initialized\n")
+		return
+	}
+	if metadata == nil {
+		metadata = make(map[string]interface{})
+	}
+
+	// Add standard fields
+	metadata["tenant_id"] = v.tenantID
+	metadata["user_id"] = v.userID
+	metadata["request_id"] = requestID
+	metadata["timestamp"] = time.Now().UTC()
+
+	success := err == nil
+	if err != nil {
+		metadata["error"] = err.Error()
+	}
+
+	if auditErr := v.audit.Log(action, success, metadata); auditErr != nil {
+		log.Printf("ERROR: audit logging failed for action %s: %v\n", action, auditErr)
+	}
+}
+
+func (v *Vault) newRequestID() string {
+	return fmt.Sprintf("v_%d", time.Now().UnixNano())
 }

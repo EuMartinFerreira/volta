@@ -453,7 +453,7 @@ func TestLoadKey(t *testing.T) {
 
 	// Create new vault instance to test loading
 	options := createTestOptionsWithPath()
-	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil) // Use New() instead of manual setup
+	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -567,7 +567,7 @@ func TestSaveKey(t *testing.T) {
 	options := createTestOptionsWithPath()
 
 	// Create new vault to test loading
-	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err == nil {
 		defer vault2.Close()
 		if vault2.(*Vault).currentKeyID == originalKeyID {
@@ -581,7 +581,7 @@ func TestLoadKeyFromMetadata(t *testing.T) {
 	tempDir := t.TempDir()
 	options := createTestOptionsWithPath()
 
-	vault1, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault1, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create first vault: %v", err)
 	}
@@ -603,7 +603,7 @@ func TestLoadKeyFromMetadata(t *testing.T) {
 	vault1.Close()
 
 	// Create new vault instance using the SAME temp directory to test loading from metadata
-	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil) // Use same options, same tempDir
+	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID) // Use same options, same tempDir
 	if err != nil {
 		t.Fatalf("Failed to create new vault: %v", err)
 	}
@@ -625,7 +625,7 @@ func TestLoadKeyFromMetadata(t *testing.T) {
 	// Test with nonexistent metadata
 	tempDir2 := t.TempDir()
 	options2 := createTestOptionsWithPath()
-	vault3, err := NewWithStore(options2, createStore(testStoreType, tempDir2, tenantID), nil)
+	vault3, err := NewWithStore(options2, createStore(testStoreType, tempDir2, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault with no metadata: %v", err)
 	}
@@ -657,7 +657,7 @@ func TestSaveAndLoadEncryptedKeys(t *testing.T) {
 	tempDir := t.TempDir()
 	options := createTestOptionsWithPath()
 
-	vault1, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil)
+	vault1, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -695,7 +695,7 @@ func TestSaveAndLoadEncryptedKeys(t *testing.T) {
 	vault1.Close()
 
 	// Create new vault instance using the SAME options/tempDir to test loading
-	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil) // Same options, same storage
+	vault2, err := NewWithStore(options, createStore(testStoreType, tempDir, tenantID), nil, tenantID) // Same options, same storage
 	if err != nil {
 		t.Fatalf("Failed to create new vault: %v", err)
 	}

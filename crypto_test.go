@@ -36,7 +36,7 @@ func TestCryptoAll(t *testing.T) {
 func TestEncryptionDecryption(t *testing.T) {
 	options, workDir := createTestCryptoOptions()
 
-	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil)
+	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestCustomDerivation(t *testing.T) {
 	options.DerivationPassphrase = passPhrase
 
 	// Create vault with custom derivation key
-	vault1, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil)
+	vault1, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault with custom derivation: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestCustomDerivation(t *testing.T) {
 	fmt.Printf("TEST: vault1 closed, creating vault2\n")
 
 	// Create a second vault with the same derivation parameters
-	vault2, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil)
+	vault2, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create second vault: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestCustomDerivation(t *testing.T) {
 	wrongOptions.DerivationPassphrase = "wrong-passphrase-but-still-long-enough"
 
 	// This should fail because the master key can't be decrypted with the wrong passphrase
-	_, err = NewWithStore(wrongOptions, createStore(testStoreType, workDir, tenantID), nil)
+	_, err = NewWithStore(wrongOptions, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err == nil {
 		t.Error("Expected error when creating vault with wrong passphrase, got none")
 	}
@@ -145,7 +145,7 @@ func TestSecureFilePermissions(t *testing.T) {
 
 	options, workDir := createTestCryptoOptions()
 
-	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil)
+	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestKeyRotationCrypto(t *testing.T) {
 	// Clean up the test directory after test
 	defer os.RemoveAll(tempDir)
 
-	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil)
+	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestInvalidDataHandling(t *testing.T) {
 	// Clean up any existing vault directory first
 	os.RemoveAll(tempDir)
 
-	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil)
+	cryptoManager, err := NewWithStore(options, createStore(testStoreType, workDir, tenantID), nil, tenantID)
 	if err != nil {
 		t.Fatalf("Failed to create vault: %v", err)
 	}

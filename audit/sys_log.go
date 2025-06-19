@@ -96,56 +96,6 @@ func (s *SyslogLogger) Log(action string, success bool, metadata map[string]inte
 	return s.writeEvent(event)
 }
 
-func (s *SyslogLogger) LogSecretAccess(action, secretID string, success bool, errorMsg string) error {
-	if !s.config.Enabled {
-		return nil
-	}
-
-	metadata := map[string]interface{}{
-		"secret_id": secretID,
-		"type":      "secret_access",
-	}
-
-	event := Event{
-		ID:        generateEventID(),
-		Timestamp: time.Now().UTC(),
-		TenantID:  s.config.TenantID,
-		Action:    action,
-		Success:   success,
-		Error:     errorMsg,
-		SecretID:  secretID,
-		Metadata:  metadata,
-		Source:    "vault",
-	}
-
-	return s.writeEvent(event)
-}
-
-func (s *SyslogLogger) LogKeyOperation(action, keyID string, success bool, errorMsg string) error {
-	if !s.config.Enabled {
-		return nil
-	}
-
-	metadata := map[string]interface{}{
-		"key_id": keyID,
-		"type":   "key_operation",
-	}
-
-	event := Event{
-		ID:        generateEventID(),
-		Timestamp: time.Now().UTC(),
-		TenantID:  s.config.TenantID,
-		Action:    action,
-		Success:   success,
-		Error:     errorMsg,
-		KeyID:     keyID,
-		Metadata:  metadata,
-		Source:    "vault",
-	}
-
-	return s.writeEvent(event)
-}
-
 func (s *SyslogLogger) Close() error {
 	if s.writer != nil {
 		err := s.writer.Close()

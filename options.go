@@ -225,6 +225,9 @@ type Options struct {
 	// - GDPR compliance for personal data protection and privacy requirements
 	// - Custom regulatory requirements for memory protection and data handling
 	EnableMemoryLock bool `json:"enable_memory_lock"`
+
+	// the user creating and using the vault manager instance
+	UserID string `json:"-"`
 }
 
 // SERIALIZATION AND PERSISTENCE BEHAVIOR:
