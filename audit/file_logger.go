@@ -98,6 +98,11 @@ func (fl *FileLogger) writeEvent(event Event) error {
 	fl.mu.Lock()
 	defer fl.mu.Unlock()
 
+	// ensures the file is open in case it has been close by a previous vault that was using this logger
+	if err := fl.ensureFileOpen(); err != nil {
+		return err
+	}
+
 	// Serialize event to JSON
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
@@ -110,7 +115,7 @@ func (fl *FileLogger) writeEvent(event Event) error {
 	}
 
 	// Flush to ensure it's written
-	if err := fl.file.Sync(); err != nil {
+	if err = fl.file.Sync(); err != nil {
 		return fmt.Errorf("failed to sync audit log: %w", err)
 	}
 
@@ -374,6 +379,18 @@ func (fl *FileLogger) Close() error {
 		err := fl.file.Close()
 		fl.file = nil
 		return err
+	}
+	return nil
+}
+
+func (fl *FileLogger) ensureFileOpen() error {
+	if fl.file == nil {
+		var err error
+		fl.file, err = os.OpenFile(fl.fileOpts.FilePath,
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to reopen audit log: %w", err)
+		}
 	}
 	return nil
 }

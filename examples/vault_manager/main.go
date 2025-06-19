@@ -13,16 +13,13 @@ func main() {
 	fmt.Println("### Example: Managing Multiple Tenant Vaults with FileStore ###")
 
 	// 1. Define VaultManager Options
-	// CRITICAL: DerivationSalt should be a unique, cryptographically random byte slice (e.g., 32 bytes),
-	// kept secret and consistent for your application. Generate ONCE and store securely.
 	// CRITICAL: DerivationPassphrase is a master passphrase for key derivation.
 	// Store these securely (e.g., environment variables, hardware security module, dedicated secret manager).
 	// DO NOT hardcode them in production code like this example.
 	options := volta.Options{
 		DerivationPassphrase: "Z5vmvP3^6UE*YwvjPZ5qZRJ7FoArSN57MRCQ@9fV2V7y&X3efYXht*LV#vX8", // Example: Load from secure env var or secret store
 		// EnvPassphraseVar: "VOLTA_MASTER_PASSPHRASE", // Alternatively, set this env var and leave DerivationPassphrase empty
-		EnableMemoryLock: true,  // Recommended: Attempts to lock sensitive memory pages in RAM.
-		Debug:            false, // Set to true for more verbose internal logging from Volta library.
+		EnableMemoryLock: true, // Recommended: Attempts to lock sensitive memory pages in RAM.
 	}
 
 	// 2. Setup Audit Logger
