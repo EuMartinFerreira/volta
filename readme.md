@@ -18,6 +18,7 @@ This document serves as a guide to understanding Volta's architecture, its compo
 
 For additional articles expanding the understanding of Volta see:
 
+- [Feature Set](docs/features.md)
 - [Facilitating GDPR compliance](docs/gdpr.md)
 - [Facilitating HIPAA compliance](docs/hipaa.md)
 - [Facilitating PCI-DSS compliance](docs/pci_dss.md)
